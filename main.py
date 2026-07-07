@@ -3,9 +3,9 @@ import logging
 from dotenv import load_dotenv
 from telegram.ext import ApplicationBuilder, CommandHandler
 
-import handlers
-
 load_dotenv()
+
+import handlers
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
