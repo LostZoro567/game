@@ -1,0 +1,16 @@
+[Unit]
+Description=DickGrow Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_VPS_USERNAME
+WorkingDirectory=/home/YOUR_VPS_USERNAME/dickgrowbot
+EnvironmentFile=/home/YOUR_VPS_USERNAME/dickgrowbot/.env
+ExecStart=/home/YOUR_VPS_USERNAME/dickgrowbot/venv/bin/python3 bot.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
