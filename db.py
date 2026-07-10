@@ -9,7 +9,7 @@ _pool: Optional[asyncpg.Pool] = None
 
 async def init_pool():
     global _pool
-    _pool = await asyncpg.create_pool(os.environ["DATABASE_URL"], min_size=1, max_size=5)
+    _pool = await asyncpg.create_pool(os.environ["DATABASE_URL"], min_size=2, max_size=10)
 
 
 async def run_schema():
