@@ -48,11 +48,14 @@ async def apply_growth(
     log_type: str,
     set_last_grow: bool = False,
     clamp_zero: bool = False,
+    floor: int | None = None,
 ) -> int:
     """
     Adjusts a user's height and logs the change atomically.
     clamp_zero=True means a negative result is floored at 0 (used for attack losses).
-    Loan repayment deliberately does NOT clamp, so it can push a user to -10cm.
+    floor, if set, caps how far a negative change can push the user down
+    (used for loan repayment, which can push a user to -10cm but no further,
+    regardless of what they did between taking the loan and it coming due).
     """
     async with _pool.acquire() as conn:
         async with conn.transaction():
@@ -66,6 +69,9 @@ async def apply_growth(
             if clamp_zero and new_height < 0:
                 actual_amount = -current
                 new_height = 0
+            elif floor is not None and new_height < floor:
+                actual_amount = floor - current
+                new_height = floor
 
             if set_last_grow:
                 await conn.execute(
