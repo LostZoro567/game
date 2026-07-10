@@ -27,9 +27,8 @@ logger = logging.getLogger(__name__)
 GROW_MIN, GROW_MAX = 10, 25
 GROW_COOLDOWN_HOURS = 24
 
-ATTACK_MIN, ATTACK_MAX = 15, 40
-
 LOAN_AMOUNT = 10
+LOAN_FLOOR = -10  # a defaulted loan can push a user down to this, but no further
 LOAN_DURATION_HOURS = 24
 LOAN_CHECK_INTERVAL_SECONDS = 300  # how often the repayment job runs
 
@@ -51,7 +50,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
         "📏 Welcome to <b>DickGrow Bot</b>!\n\n"
         "/grow — grow 10-25cm, once a day\n"
-        "/attack — throw a challenge at the group\n"
+        "/attack &lt;amount&gt; — challenge the group for any amount from 1cm up to your full height\n"
         "/me — check your stats\n"
         "/loan — borrow 10cm when you're at 0\n"
         "/leaderboard — today's and all-time rankings\n"
@@ -85,9 +84,31 @@ async def grow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def attack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    await db.get_or_create_user(u.id, u.username, u.first_name)
+    user = await db.get_or_create_user(u.id, u.username, u.first_name)
 
-    amount = random.randint(ATTACK_MIN, ATTACK_MAX)
+    if not context.args:
+        await update.message.reply_html(
+            "⚔️ Usage: <code>/attack &lt;amount&gt;</code>\n"
+            f"Pick anywhere from 1cm up to your full height ({user['height_cm']}cm)."
+        )
+        return
+
+    try:
+        amount = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("That's not a valid number. Try e.g. /attack 20")
+        return
+
+    if amount < 1:
+        await update.message.reply_text("Minimum challenge amount is 1cm.")
+        return
+
+    if amount > user["height_cm"]:
+        await update.message.reply_text(
+            f"You've only got {user['height_cm']}cm — you can't challenge more than that."
+        )
+        return
+
     challenge_id = await db.create_challenge(update.effective_chat.id, u.id, amount)
 
     keyboard = InlineKeyboardMarkup(
@@ -219,7 +240,7 @@ async def loan_repayment_job(context: ContextTypes.DEFAULT_TYPE):
     due_loans = await db.get_due_loans(LOAN_DURATION_HOURS)
     for loan_row in due_loans:
         telegram_id = loan_row["telegram_id"]
-        await db.apply_growth(telegram_id, -LOAN_AMOUNT, "loan_repay", clamp_zero=False)
+        await db.apply_growth(telegram_id, -LOAN_AMOUNT, "loan_repay", floor=LOAN_FLOOR)
         await db.clear_loan(telegram_id)
         logger.info(f"Repaid loan for user {telegram_id}")
 
