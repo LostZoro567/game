@@ -6,9 +6,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=YOUR_VPS_USERNAME
-WorkingDirectory=/home/YOUR_VPS_USERNAME/dickgrowbot
-EnvironmentFile=/home/YOUR_VPS_USERNAME/dickgrowbot/.env
-ExecStart=/home/YOUR_VPS_USERNAME/dickgrowbot/venv/bin/python3 bot.py
+WorkingDirectory=/home/YOUR_VPS_USERNAME/game
+EnvironmentFile=/home/YOUR_VPS_USERNAME/game/.env
+ExecStart=/home/YOUR_VPS_USERNAME/game/venv/bin/python3 bot.py
 Restart=on-failure
 RestartSec=5
 
