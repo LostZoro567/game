@@ -1,5 +1,6 @@
 import os
-from datetime import datetime, timezone
+import random
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import asyncpg
@@ -20,10 +21,6 @@ async def run_schema():
     async with _pool.acquire() as conn:
         await conn.execute(sql)
 
-
-# ---------------------------------------------------------------
-# Users
-# ---------------------------------------------------------------
 
 async def get_or_create_user(telegram_id: int, username: str | None, first_name: str | None):
     async with _pool.acquire() as conn:
@@ -47,11 +44,34 @@ async def get_user(telegram_id: int):
 
 
 async def get_user_by_username(username: str):
-    """Case-insensitive lookup. Only finds users the bot has already seen."""
     async with _pool.acquire() as conn:
         return await conn.fetchrow(
-            "SELECT * FROM users WHERE lower(username)=lower($1)", username.lstrip("@")
+            "SELECT * FROM users WHERE lower(username)=lower($1)", username
         )
+
+
+async def record_chat_member(chat_id: int, telegram_id: int):
+    """Called on every command so we know who's actually active in a given group."""
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO chat_members (chat_id, telegram_id)
+               VALUES ($1, $2) ON CONFLICT DO NOTHING""",
+            chat_id, telegram_id,
+        )
+
+
+async def get_chat_member_ids(chat_id: int, exclude: int | None = None):
+    async with _pool.acquire() as conn:
+        if exclude is not None:
+            rows = await conn.fetch(
+                "SELECT telegram_id FROM chat_members WHERE chat_id=$1 AND telegram_id != $2",
+                chat_id, exclude,
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT telegram_id FROM chat_members WHERE chat_id=$1", chat_id
+            )
+        return [r["telegram_id"] for r in rows]
 
 
 async def apply_growth(
@@ -64,10 +84,10 @@ async def apply_growth(
 ) -> int:
     """
     Adjusts a user's height and logs the change atomically.
-    clamp_zero=True means a negative result is floored at 0 (used for attack losses,
-    snitch losses, curse losses).
+    clamp_zero=True means a negative result is floored at 0 (used for attack losses).
     floor, if set, caps how far a negative change can push the user down
-    (used for loan repayment, which can push a user to -10cm but no further).
+    (used for loan repayment, which can push a user to -10cm but no further,
+    regardless of what they did between taking the loan and it coming due).
     """
     async with _pool.acquire() as conn:
         async with conn.transaction():
@@ -103,51 +123,110 @@ async def apply_growth(
             return new_height
 
 
-async def set_last_grow_date(telegram_id: int, today):
+async def set_last_pray(telegram_id: int):
     async with _pool.acquire() as conn:
         await conn.execute(
-            "UPDATE users SET last_grow_date=$1 WHERE telegram_id=$2", today, telegram_id
+            "UPDATE users SET last_pray=now() WHERE telegram_id=$1", telegram_id
         )
 
 
-async def clear_ed(telegram_id: int):
-    """Consumes the ED (hex) debuff after it's been applied to a grow roll."""
+async def transfer_cm(from_id: int, to_id: int, amount: int, type_out: str, type_in: str) -> bool:
+    """
+    Atomically moves cm from one user to another. Returns False if the sender
+    doesn't actually have enough (caller should already have checked, but this
+    is the last line of defense against races).
+    """
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            sender = await conn.fetchrow(
+                "SELECT height_cm FROM users WHERE telegram_id=$1 FOR UPDATE", from_id
+            )
+            if sender["height_cm"] < amount:
+                return False
+
+            await conn.execute(
+                "UPDATE users SET height_cm = height_cm - $1 WHERE telegram_id=$2",
+                amount, from_id,
+            )
+            await conn.execute(
+                "UPDATE users SET height_cm = height_cm + $1 WHERE telegram_id=$2",
+                amount, to_id,
+            )
+            await conn.execute(
+                "INSERT INTO growth_log (telegram_id, amount, type) VALUES ($1, $2, $3)",
+                from_id, -amount, type_out,
+            )
+            await conn.execute(
+                "INSERT INTO growth_log (telegram_id, amount, type) VALUES ($1, $2, $3)",
+                to_id, amount, type_in,
+            )
+            return True
+
+
+async def set_last_simp(telegram_id: int):
     async with _pool.acquire() as conn:
         await conn.execute(
-            "UPDATE users SET ed_expires_at=NULL WHERE telegram_id=$1", telegram_id
+            "UPDATE users SET last_simp=now() WHERE telegram_id=$1", telegram_id
         )
 
 
-def is_protected(user_row) -> bool:
-    exp = user_row["condom_expires_at"]
-    return exp is not None and exp > datetime.now(timezone.utc)
+async def cast_hex(caster_id: int, target_id: int, cost: int, duration_hours: int) -> bool:
+    """
+    Charges the caster and arms a debuff on the target's next /grow.
+    Returns False if the caster can't afford it.
+    """
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            caster = await conn.fetchrow(
+                "SELECT height_cm FROM users WHERE telegram_id=$1 FOR UPDATE", caster_id
+            )
+            if caster["height_cm"] < cost:
+                return False
+
+            await conn.execute(
+                "UPDATE users SET height_cm = height_cm - $1 WHERE telegram_id=$2",
+                cost, caster_id,
+            )
+            await conn.execute(
+                "INSERT INTO growth_log (telegram_id, amount, type) VALUES ($1, $2, 'hex_cast')",
+                caster_id, -cost,
+            )
+            expires = datetime.now(timezone.utc) + timedelta(hours=duration_hours)
+            await conn.execute(
+                """UPDATE users SET hex_active=true, hex_expires_at=$1
+                   WHERE telegram_id=$2""",
+                expires, target_id,
+            )
+            return True
 
 
-# ---------------------------------------------------------------
-# Chat membership (used so /cursethisgroup only hits people from
-# the group it was actually run in)
-# ---------------------------------------------------------------
-
-async def track_chat_member(chat_id: int, telegram_id: int):
+async def set_last_hex_cast(telegram_id: int):
     async with _pool.acquire() as conn:
         await conn.execute(
-            """INSERT INTO chat_members (chat_id, telegram_id) VALUES ($1, $2)
-               ON CONFLICT DO NOTHING""",
-            chat_id, telegram_id,
+            "UPDATE users SET last_hex_cast=now() WHERE telegram_id=$1", telegram_id
         )
 
 
-async def get_chat_member_ids(chat_id: int) -> list[int]:
+async def consume_hex_if_active(telegram_id: int) -> bool:
+    """
+    Checks + clears a user's hex right before a /grow roll. Returns True if a
+    live (non-expired) hex was consumed, meaning the caller should halve the roll.
+    Always clears the flag either way (expired hexes just fizzle silently).
+    """
     async with _pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT telegram_id FROM chat_members WHERE chat_id=$1", chat_id
+        row = await conn.fetchrow(
+            "SELECT hex_active, hex_expires_at FROM users WHERE telegram_id=$1", telegram_id
         )
-        return [r["telegram_id"] for r in rows]
+        if not row["hex_active"]:
+            return False
+        await conn.execute(
+            "UPDATE users SET hex_active=false, hex_expires_at=NULL WHERE telegram_id=$1",
+            telegram_id,
+        )
+        if row["hex_expires_at"] and row["hex_expires_at"] > datetime.now(timezone.utc):
+            return True
+        return False
 
-
-# ---------------------------------------------------------------
-# Attack / challenges (unchanged)
-# ---------------------------------------------------------------
 
 async def create_challenge(chat_id: int, challenger_id: int, amount: int) -> int:
     async with _pool.acquire() as conn:
@@ -172,6 +251,10 @@ async def get_challenge(challenge_id: int):
 
 
 async def resolve_challenge(challenge_id: int, winner_id: int, loser_id: int) -> bool:
+    """
+    Atomically claims a challenge. Returns False if it was already resolved by
+    someone else (protects against two people tapping the button at once).
+    """
     async with _pool.acquire() as conn:
         row = await conn.fetchrow(
             """UPDATE challenges
@@ -182,10 +265,6 @@ async def resolve_challenge(challenge_id: int, winner_id: int, loser_id: int) ->
         )
         return row is not None
 
-
-# ---------------------------------------------------------------
-# Loans (unchanged)
-# ---------------------------------------------------------------
 
 async def create_loan(telegram_id: int, amount: int):
     async with _pool.acquire() as conn:
@@ -225,22 +304,146 @@ async def clear_loan(telegram_id: int):
         )
 
 
-# ---------------------------------------------------------------
-# Leaderboard
-# ---------------------------------------------------------------
+async def buy_condom(telegram_id: int, cost: int, duration_hours: int) -> bool:
+    """Charges the user and extends their condom protection. False if broke."""
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT height_cm FROM users WHERE telegram_id=$1 FOR UPDATE", telegram_id
+            )
+            if row["height_cm"] < cost:
+                return False
+            await conn.execute(
+                "UPDATE users SET height_cm = height_cm - $1 WHERE telegram_id=$2",
+                cost, telegram_id,
+            )
+            await conn.execute(
+                "INSERT INTO growth_log (telegram_id, amount, type) VALUES ($1, $2, 'condom')",
+                telegram_id, -cost,
+            )
+            until = datetime.now(timezone.utc) + timedelta(hours=duration_hours)
+            await conn.execute(
+                "UPDATE users SET condom_until=$1 WHERE telegram_id=$2", until, telegram_id
+            )
+            return True
 
-async def get_leaderboard_today(start_of_day, limit: int = 5):
+
+async def set_last_snitch(telegram_id: int):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET last_snitch=now() WHERE telegram_id=$1", telegram_id
+        )
+
+
+async def snitch_steal(actor_id: int, target_id: int, min_pct: int, max_pct: int):
+    """
+    Steals a random min_pct-max_pct slice of the target's current height.
+    Returns the stolen amount (0 if target had nothing to take).
+    """
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            target = await conn.fetchrow(
+                "SELECT height_cm FROM users WHERE telegram_id=$1 FOR UPDATE", target_id
+            )
+            if target["height_cm"] <= 0:
+                return 0
+            pct = random.randint(min_pct, max_pct)
+            amount = max(1, (target["height_cm"] * pct) // 100)
+            amount = min(amount, target["height_cm"])
+
+            await conn.execute(
+                "UPDATE users SET height_cm = height_cm - $1 WHERE telegram_id=$2",
+                amount, target_id,
+            )
+            await conn.execute(
+                "UPDATE users SET height_cm = height_cm + $1 WHERE telegram_id=$2",
+                amount, actor_id,
+            )
+            await conn.execute(
+                "INSERT INTO growth_log (telegram_id, amount, type) VALUES ($1, $2, 'snitched_from')",
+                target_id, -amount,
+            )
+            await conn.execute(
+                "INSERT INTO growth_log (telegram_id, amount, type) VALUES ($1, $2, 'snitch_gain')",
+                actor_id, amount,
+            )
+            return amount
+
+
+async def get_leaderboard_today(limit: int = 5):
     async with _pool.acquire() as conn:
         return await conn.fetch(
             """SELECT u.telegram_id, u.first_name, u.username, SUM(g.amount) AS gained
                FROM growth_log g
                JOIN users u ON u.telegram_id = g.telegram_id
-               WHERE g.created_at >= $2
+               WHERE g.created_at >= date_trunc('day', now())
                GROUP BY u.telegram_id, u.first_name, u.username
                ORDER BY gained DESC
                LIMIT $1""",
-            limit, start_of_day,
+            limit,
         )
+
+
+async def get_last_group_curse(chat_id: int):
+    async with _pool.acquire() as conn:
+        return await conn.fetchrow(
+            """SELECT * FROM group_curses WHERE chat_id=$1
+               ORDER BY started_at DESC LIMIT 1""",
+            chat_id,
+        )
+
+
+async def create_group_curse(
+    chat_id: int,
+    initiator_id: int,
+    victim_ids: list[int],
+    window_hours: int,
+    dmg_min: int,
+    dmg_max: int,
+) -> int:
+    """
+    Creates the curse row plus one curse_hit per victim, each fired at a random
+    moment inside the curse window. The initiator is always included and flagged.
+    """
+    now = datetime.now(timezone.utc)
+    ends_at = now + timedelta(hours=window_hours)
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            curse_row = await conn.fetchrow(
+                """INSERT INTO group_curses (chat_id, initiator_id, ends_at)
+                   VALUES ($1, $2, $3) RETURNING id""",
+                chat_id, initiator_id, ends_at,
+            )
+            curse_id = curse_row["id"]
+
+            for victim_id in victim_ids:
+                amount = random.randint(dmg_min, dmg_max)
+                offset_seconds = random.randint(0, window_hours * 3600)
+                scheduled_at = now + timedelta(seconds=offset_seconds)
+                await conn.execute(
+                    """INSERT INTO curse_hits
+                       (curse_id, telegram_id, amount, is_initiator, scheduled_at)
+                       VALUES ($1, $2, $3, $4, $5)""",
+                    curse_id, victim_id, amount, victim_id == initiator_id, scheduled_at,
+                )
+            return curse_id
+
+
+async def get_due_curse_hits():
+    async with _pool.acquire() as conn:
+        return await conn.fetch(
+            """SELECT ch.id, ch.telegram_id, ch.amount, ch.is_initiator, gc.chat_id
+               FROM curse_hits ch
+               JOIN group_curses gc ON gc.id = ch.curse_id
+               WHERE ch.applied=false AND ch.scheduled_at <= now()"""
+        )
+
+
+async def apply_curse_hit(hit_id: int, telegram_id: int, amount: int) -> int:
+    # Mark applied first so a crash mid-flight can't double-fire this hit.
+    async with _pool.acquire() as conn:
+        await conn.execute("UPDATE curse_hits SET applied=true WHERE id=$1", hit_id)
+    return await apply_growth(telegram_id, -amount, "cursed", clamp_zero=True)
 
 
 async def get_leaderboard_alltime(limit: int = 5):
@@ -254,444 +457,105 @@ async def get_leaderboard_alltime(limit: int = 5):
         )
 
 
-# ---------------------------------------------------------------
-# /pray
-# ---------------------------------------------------------------
-
-async def pray(telegram_id: int, win_amount: int):
-    """Returns ('used', None) | ('lose', new_height) | ('win', new_height)."""
-    async with _pool.acquire() as conn:
-        async with conn.transaction():
-            row = await conn.fetchrow(
-                "SELECT prayed, height_cm FROM users WHERE telegram_id=$1 FOR UPDATE",
-                telegram_id,
-            )
-            if row["prayed"]:
-                return "used", row["height_cm"]
-
-            await conn.execute(
-                "UPDATE users SET prayed=true WHERE telegram_id=$1", telegram_id
-            )
-
-            import random
-            if random.random() < 0.01:
-                new_height = row["height_cm"] + win_amount
-                await conn.execute(
-                    "UPDATE users SET height_cm=$1 WHERE telegram_id=$2",
-                    new_height, telegram_id,
-                )
-                await conn.execute(
-                    "INSERT INTO growth_log (telegram_id, amount, type) VALUES ($1, $2, 'pray')",
-                    telegram_id, win_amount,
-                )
-                return "win", new_height
-            return "lose", row["height_cm"]
-
-
-# ---------------------------------------------------------------
-# /simp
-# ---------------------------------------------------------------
-
-async def simp(giver_id: int, receiver_id: int, amount: int, today, daily_limit: int):
-    """
-    Returns one of:
-      ('limit', None)
-      ('insufficient', giver_height)
-      ('success', giver_new_height, receiver_new_height)
-    """
-    async with _pool.acquire() as conn:
-        async with conn.transaction():
-            giver = await conn.fetchrow(
-                "SELECT height_cm, simp_count, simp_date FROM users WHERE telegram_id=$1 FOR UPDATE",
-                giver_id,
-            )
-            count = giver["simp_count"]
-            if giver["simp_date"] != today:
-                count = 0
-
-            if count >= daily_limit:
-                return "limit", None
-
-            if giver["height_cm"] < amount:
-                return "insufficient", giver["height_cm"]
-
-            new_giver_height = giver["height_cm"] - amount
-            await conn.execute(
-                "UPDATE users SET height_cm=$1, simp_count=$2, simp_date=$3 WHERE telegram_id=$4",
-                new_giver_height, count + 1, today, giver_id,
-            )
-            await conn.execute(
-                "INSERT INTO growth_log (telegram_id, amount, type) VALUES ($1, $2, 'simp_give')",
-                giver_id, -amount,
-            )
-
-            receiver = await conn.fetchrow(
-                "SELECT height_cm FROM users WHERE telegram_id=$1 FOR UPDATE", receiver_id
-            )
-            new_receiver_height = receiver["height_cm"] + amount
-            await conn.execute(
-                "UPDATE users SET height_cm=$1 WHERE telegram_id=$2",
-                new_receiver_height, receiver_id,
-            )
-            await conn.execute(
-                "INSERT INTO growth_log (telegram_id, amount, type) VALUES ($1, $2, 'simp_receive')",
-                receiver_id, amount,
-            )
-
-            return "success", new_giver_height, new_receiver_height
-
-
-# ---------------------------------------------------------------
-# /hex
-# ---------------------------------------------------------------
-
-async def hex_target(attacker_id: int, target_id: int, cost: int, duration_hours: int):
-    """
-    Returns one of:
-      ('self', None)
-      ('blocked', None)                -- target wearing a condom
-      ('insufficient', attacker_height)
-      ('success', attacker_new_height)
-    """
-    if attacker_id == target_id:
-        return "self", None
-
-    async with _pool.acquire() as conn:
-        async with conn.transaction():
-            target = await conn.fetchrow(
-                "SELECT condom_expires_at FROM users WHERE telegram_id=$1 FOR UPDATE", target_id
-            )
-            if target["condom_expires_at"] and target["condom_expires_at"] > datetime.now(timezone.utc):
-                return "blocked", None
-
-            attacker = await conn.fetchrow(
-                "SELECT height_cm FROM users WHERE telegram_id=$1 FOR UPDATE", attacker_id
-            )
-            if attacker["height_cm"] < cost:
-                return "insufficient", attacker["height_cm"]
-
-            new_height = attacker["height_cm"] - cost
-            await conn.execute(
-                "UPDATE users SET height_cm=$1 WHERE telegram_id=$2", new_height, attacker_id
-            )
-            await conn.execute(
-                "INSERT INTO growth_log (telegram_id, amount, type) VALUES ($1, $2, 'hex_cost')",
-                attacker_id, -cost,
-            )
-            await conn.execute(
-                """UPDATE users SET ed_expires_at = now() + ($1 || ' hours')::interval
-                   WHERE telegram_id=$2""",
-                str(duration_hours), target_id,
-            )
-            return "success", new_height
-
-
-# ---------------------------------------------------------------
-# /snitch
-# ---------------------------------------------------------------
-
-async def snitch(attacker_id: int, target_id: int, min_pct: float, max_pct: float, cooldown_hours: int):
-    """
-    Returns one of:
-      ('self', None)
-      ('cooldown', seconds_remaining)
-      ('blocked', None)
-      ('broke', None)                  -- target has nothing worth stealing
-      ('success', stolen, attacker_new_height, target_new_height)
-    """
-    import random
-
-    if attacker_id == target_id:
-        return "self", None
-
-    async with _pool.acquire() as conn:
-        async with conn.transaction():
-            attacker = await conn.fetchrow(
-                "SELECT height_cm, snitch_cooldown_until FROM users WHERE telegram_id=$1 FOR UPDATE",
-                attacker_id,
-            )
-            now = datetime.now(timezone.utc)
-            if attacker["snitch_cooldown_until"] and attacker["snitch_cooldown_until"] > now:
-                remaining = (attacker["snitch_cooldown_until"] - now).total_seconds()
-                return "cooldown", remaining
-
-            target = await conn.fetchrow(
-                "SELECT height_cm, condom_expires_at FROM users WHERE telegram_id=$1 FOR UPDATE",
-                target_id,
-            )
-            if target["condom_expires_at"] and target["condom_expires_at"] > now:
-                return "blocked", None
-
-            if target["height_cm"] <= 0:
-                return "broke", None
-
-            pct = random.uniform(min_pct, max_pct)
-            stolen = max(1, round(target["height_cm"] * pct))
-            stolen = min(stolen, target["height_cm"])
-
-            new_target_height = target["height_cm"] - stolen
-            new_attacker_height = attacker["height_cm"] + stolen
-
-            await conn.execute(
-                "UPDATE users SET height_cm=$1 WHERE telegram_id=$2", new_target_height, target_id
-            )
-            await conn.execute(
-                "INSERT INTO growth_log (telegram_id, amount, type) VALUES ($1, $2, 'snitch_stolen')",
-                target_id, -stolen,
-            )
-            await conn.execute(
-                """UPDATE users SET height_cm=$1,
-                   snitch_cooldown_until = now() + ($2 || ' hours')::interval
-                   WHERE telegram_id=$3""",
-                new_attacker_height, str(cooldown_hours), attacker_id,
-            )
-            await conn.execute(
-                "INSERT INTO growth_log (telegram_id, amount, type) VALUES ($1, $2, 'snitch_steal')",
-                attacker_id, stolen,
-            )
-            return "success", stolen, new_attacker_height, new_target_height
-
-
-# ---------------------------------------------------------------
-# Condom shop
-# ---------------------------------------------------------------
-
-def condom_cost_for(height_cm: int, tier1_cost: int, tier2_cost: int, tier3_cost: int) -> int:
-    if height_cm < 100:
-        return tier1_cost
-    if height_cm < 1000:
-        return tier2_cost
-    return tier3_cost
-
-
-async def buy_condom(telegram_id: int, duration_hours: int, tier1: int, tier2: int, tier3: int):
-    """
-    Returns one of:
-      ('already_active', expires_at)
-      ('insufficient', cost, height)
-      ('success', cost, expires_at)
-    """
-    async with _pool.acquire() as conn:
-        async with conn.transaction():
-            row = await conn.fetchrow(
-                "SELECT height_cm, condom_expires_at FROM users WHERE telegram_id=$1 FOR UPDATE",
-                telegram_id,
-            )
-            now = datetime.now(timezone.utc)
-            if row["condom_expires_at"] and row["condom_expires_at"] > now:
-                return "already_active", row["condom_expires_at"]
-
-            cost = condom_cost_for(row["height_cm"], tier1, tier2, tier3)
-            if row["height_cm"] < cost:
-                return "insufficient", cost, row["height_cm"]
-
-            new_height = row["height_cm"] - cost
-            expires_at = now.replace(microsecond=0)
-            await conn.execute(
-                """UPDATE users SET height_cm=$1,
-                   condom_expires_at = now() + ($2 || ' hours')::interval
-                   WHERE telegram_id=$3""",
-                new_height, str(duration_hours), telegram_id,
-            )
-            await conn.execute(
-                "INSERT INTO growth_log (telegram_id, amount, type) VALUES ($1, $2, 'condom_buy')",
-                telegram_id, -cost,
-            )
-            row2 = await conn.fetchrow(
-                "SELECT condom_expires_at FROM users WHERE telegram_id=$1", telegram_id
-            )
-            return "success", cost, row2["condom_expires_at"]
-
-
-# ---------------------------------------------------------------
-# /cursethisgroup
-# ---------------------------------------------------------------
-
-async def get_group_curse_cooldown(chat_id: int):
-    async with _pool.acquire() as conn:
-        return await conn.fetchrow(
-            "SELECT last_cursed_at FROM group_curses WHERE chat_id=$1", chat_id
-        )
-
-
-async def set_group_curse_time(chat_id: int):
+async def set_last_gamble(telegram_id: int):
     async with _pool.acquire() as conn:
         await conn.execute(
-            """INSERT INTO group_curses (chat_id, last_cursed_at) VALUES ($1, now())
-               ON CONFLICT (chat_id) DO UPDATE SET last_cursed_at = now()""",
-            chat_id,
+            "UPDATE users SET last_gamble=now() WHERE telegram_id=$1", telegram_id
         )
 
 
-async def create_curse_events(chat_id: int, events: list[tuple[int, int, bool, datetime]]):
-    """events: list of (telegram_id, amount, protected, scheduled_at). Returns list of ids."""
-    async with _pool.acquire() as conn:
-        ids = []
-        for telegram_id, amount, protected, scheduled_at in events:
-            row = await conn.fetchrow(
-                """INSERT INTO curse_events (chat_id, telegram_id, amount, protected, scheduled_at)
-                   VALUES ($1, $2, $3, $4, $5) RETURNING id""",
-                chat_id, telegram_id, amount, protected, scheduled_at,
-            )
-            ids.append(row["id"])
-        return ids
+async def gamble_win(telegram_id: int, amount: int) -> int:
+    return await apply_growth(telegram_id, amount, "gamble_win")
 
 
-async def get_pending_curse_events():
+async def gamble_lose_become_pussy(telegram_id: int, chat_id: int):
     async with _pool.acquire() as conn:
-        return await conn.fetch(
-            "SELECT * FROM curse_events WHERE executed=false ORDER BY scheduled_at"
+        await conn.execute(
+            """UPDATE users
+               SET pussy_active=true, pussy_started_at=now(), pussy_accum=0,
+                   pussy_chat_id=$1, pussy_hour2_announced=false
+               WHERE telegram_id=$2""",
+            chat_id, telegram_id,
         )
-
-
-async def execute_curse_event(event_id: int):
-    """
-    Atomically claims + executes a curse event. Returns None if already executed,
-    otherwise a dict with telegram_id, chat_id, amount, protected, new_height.
-    """
-    async with _pool.acquire() as conn:
-        async with conn.transaction():
-            event = await conn.fetchrow(
-                "SELECT * FROM curse_events WHERE id=$1 AND executed=false FOR UPDATE", event_id
-            )
-            if event is None:
-                return None
-
-            await conn.execute(
-                "UPDATE curse_events SET executed=true WHERE id=$1", event_id
-            )
-
-            if event["protected"]:
-                return {
-                    "telegram_id": event["telegram_id"],
-                    "chat_id": event["chat_id"],
-                    "amount": event["amount"],
-                    "protected": True,
-                    "new_height": None,
-                }
-
-            user = await conn.fetchrow(
-                "SELECT height_cm FROM users WHERE telegram_id=$1 FOR UPDATE", event["telegram_id"]
-            )
-            actual = event["amount"]
-            new_height = user["height_cm"] - actual
-            if new_height < 0:
-                actual = user["height_cm"]
-                new_height = 0
-
-            await conn.execute(
-                "UPDATE users SET height_cm=$1 WHERE telegram_id=$2", new_height, event["telegram_id"]
-            )
-            await conn.execute(
-                "INSERT INTO growth_log (telegram_id, amount, type) VALUES ($1, $2, 'curse')",
-                event["telegram_id"], -actual,
-            )
-            return {
-                "telegram_id": event["telegram_id"],
-                "chat_id": event["chat_id"],
-                "amount": actual,
-                "protected": False,
-                "new_height": new_height,
-            }
-
-
-# ---------------------------------------------------------------
-# /gamble + pussy mode
-# ---------------------------------------------------------------
-
-async def gamble(telegram_id: int, chat_id: int, win_chance: float, win_amount: int):
-    """Returns ('win', new_height) or ('lose', pussy_started_at)."""
-    import random
-    async with _pool.acquire() as conn:
-        async with conn.transaction():
-            row = await conn.fetchrow(
-                "SELECT height_cm FROM users WHERE telegram_id=$1 FOR UPDATE", telegram_id
-            )
-            if random.random() < win_chance:
-                new_height = row["height_cm"] + win_amount
-                await conn.execute(
-                    "UPDATE users SET height_cm=$1 WHERE telegram_id=$2", new_height, telegram_id
-                )
-                await conn.execute(
-                    "INSERT INTO growth_log (telegram_id, amount, type) VALUES ($1, $2, 'gamble_win')",
-                    telegram_id, win_amount,
-                )
-                return "win", new_height
-            else:
-                now = datetime.now(timezone.utc)
-                await conn.execute(
-                    """UPDATE users SET pussy_active=true, pussy_started_at=$1,
-                       pussy_banked=0, pussy_chat_id=$2 WHERE telegram_id=$3""",
-                    now, chat_id, telegram_id,
-                )
-                return "lose", now
 
 
 async def get_pussy_status(telegram_id: int):
-    return await get_user(telegram_id)
-
-
-async def get_active_pussies():
-    async with _pool.acquire() as conn:
-        return await conn.fetch("SELECT * FROM users WHERE pussy_active=true")
-
-
-async def has_fucked(pussy_id: int, fucker_id: int, stage: int, since: datetime) -> bool:
+    """Returns the row if the user is currently an active (non-expired) pussy, else None."""
     async with _pool.acquire() as conn:
         row = await conn.fetchrow(
-            """SELECT 1 FROM fuck_log
-               WHERE pussy_id=$1 AND fucker_id=$2 AND hour_stage=$3 AND created_at >= $4""",
-            pussy_id, fucker_id, stage, since,
+            "SELECT * FROM users WHERE telegram_id=$1 AND pussy_active=true", telegram_id
         )
-        return row is not None
+        return row
 
 
-async def record_fuck(pussy_id: int, fucker_id: int, stage: int, gain: int) -> int:
-    """Applies the gain to the fucker, banks it for the pussy user. Returns fucker's new height."""
+async def record_fuck(target_id: int, actor_id: int, hour_window: int) -> bool:
+    """Returns False if this actor already fucked this target in this hour window."""
+    async with _pool.acquire() as conn:
+        try:
+            await conn.execute(
+                """INSERT INTO fuck_log (target_id, actor_id, hour_window)
+                   VALUES ($1, $2, $3)""",
+                target_id, actor_id, hour_window,
+            )
+            return True
+        except asyncpg.UniqueViolationError:
+            return False
+
+
+async def apply_fuck_gain(actor_id: int, target_id: int, actor_gain: int, pussy_gain: int):
     async with _pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute(
-                "INSERT INTO fuck_log (pussy_id, fucker_id, hour_stage) VALUES ($1, $2, $3)",
-                pussy_id, fucker_id, stage,
-            )
-            fucker = await conn.fetchrow(
-                "SELECT height_cm FROM users WHERE telegram_id=$1 FOR UPDATE", fucker_id
-            )
-            new_height = fucker["height_cm"] + gain
-            await conn.execute(
-                "UPDATE users SET height_cm=$1 WHERE telegram_id=$2", new_height, fucker_id
+                "UPDATE users SET height_cm = height_cm + $1 WHERE telegram_id=$2",
+                actor_gain, actor_id,
             )
             await conn.execute(
                 "INSERT INTO growth_log (telegram_id, amount, type) VALUES ($1, $2, 'fuck_gain')",
-                fucker_id, gain,
+                actor_id, actor_gain,
             )
             await conn.execute(
-                "UPDATE users SET pussy_banked = pussy_banked + $1 WHERE telegram_id=$2",
-                gain, pussy_id,
+                "UPDATE users SET pussy_accum = pussy_accum + $1 WHERE telegram_id=$2",
+                pussy_gain, target_id,
             )
-            return new_height
 
 
-async def end_pussy(telegram_id: int):
-    """Pays out the banked gain to the (former) pussy user's real height and clears the status."""
+async def get_pussies_needing_hour2_announcement():
+    async with _pool.acquire() as conn:
+        return await conn.fetch(
+            """SELECT telegram_id, pussy_chat_id FROM users
+               WHERE pussy_active=true AND pussy_hour2_announced=false
+               AND pussy_started_at <= now() - interval '1 hour'"""
+        )
+
+
+async def mark_hour2_announced(telegram_id: int):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET pussy_hour2_announced=true WHERE telegram_id=$1", telegram_id
+        )
+
+
+async def get_expired_pussies(duration_hours: int):
+    async with _pool.acquire() as conn:
+        return await conn.fetch(
+            """SELECT telegram_id, pussy_chat_id, pussy_accum FROM users
+               WHERE pussy_active=true
+               AND pussy_started_at <= now() - ($1 || ' hours')::interval""",
+            str(duration_hours),
+        )
+
+
+async def finalize_pussy(telegram_id: int, bonus: int) -> int:
+    """Adds the accumulated bonus onto the real height and clears pussy status."""
     async with _pool.acquire() as conn:
         async with conn.transaction():
-            row = await conn.fetchrow(
-                "SELECT height_cm, pussy_banked, pussy_chat_id FROM users WHERE telegram_id=$1 FOR UPDATE",
+            await conn.execute(
+                """UPDATE users
+                   SET pussy_active=false, pussy_started_at=NULL, pussy_accum=0,
+                       pussy_chat_id=NULL, pussy_hour2_announced=false
+                   WHERE telegram_id=$1""",
                 telegram_id,
             )
-            if row is None or row["pussy_banked"] is None:
-                return None
-            banked = row["pussy_banked"]
-            new_height = row["height_cm"] + banked
-            await conn.execute(
-                """UPDATE users SET height_cm=$1, pussy_active=false, pussy_started_at=NULL,
-                   pussy_banked=0, pussy_chat_id=NULL WHERE telegram_id=$2""",
-                new_height, telegram_id,
-            )
-            if banked:
-                await conn.execute(
-                    "INSERT INTO growth_log (telegram_id, amount, type) VALUES ($1, $2, 'pussy_payout')",
-                    telegram_id, banked,
-                )
-            return {"new_height": new_height, "banked": banked, "chat_id": row["pussy_chat_id"]}
+    if bonus > 0:
+        return await apply_growth(telegram_id, bonus, "pussy_bonus")
+    return (await get_user(telegram_id))["height_cm"]
