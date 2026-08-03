@@ -33,8 +33,8 @@ LOAN_DURATION_HOURS = 24
 LOAN_CHECK_INTERVAL_SECONDS = 300  # how often the repayment job runs
 
 # ---- Pray ----
-PRAY_SUCCESS_CHANCE = 0.01
-PRAY_SUCCESS_AMOUNT = 100
+PRAY_SUCCESS_CHANCE = 0.06
+PRAY_SUCCESS_AMOUNT = 500
 
 # ---- Simp ----
 SIMP_MAX_AMOUNT = 50
@@ -49,19 +49,20 @@ HEX_MULTIPLIER = 0.5  # halves the next grow roll
 # ---- Condom shop ----
 CONDOM_DURATION_HOURS = 50
 CONDOM_PRICE_TIERS = [  # (height ceiling, price) — first match wins
-    (100, 5),
+    (200, 10),
+    (500, 20),
     (1000, 50),
     (float("inf"), 200),
 ]
 
 # ---- Snitch ----
-SNITCH_STEAL_MIN_PCT = 20
+SNITCH_STEAL_MIN_PCT = 10
 SNITCH_STEAL_MAX_PCT = 30
-SNITCH_COOLDOWN_HOURS = 24
+SNITCH_COOLDOWN_HOURS = 1
 
 # ---- Curse this group ----
 CURSE_TARGET_COUNT = 5
-CURSE_DMG_MIN, CURSE_DMG_MAX = 5, 15
+CURSE_DMG_MIN, CURSE_DMG_MAX = 15, 25
 CURSE_WINDOW_HOURS = 1
 CURSE_COOLDOWN_HOURS = 12
 CURSE_CHECK_INTERVAL_SECONDS = 30  # how often we check for due curse hits
@@ -71,8 +72,8 @@ GAMBLE_COOLDOWN_HOURS = 24
 GAMBLE_WIN_CHANCE = 0.5
 GAMBLE_WIN_AMOUNT = 50
 PUSSY_DURATION_HOURS = 2
-FUCK_GAIN_HOUR1 = (2, 5)
-FUCK_GAIN_HOUR2 = (5, 10)
+FUCK_GAIN_HOUR1 = (10, 25)
+FUCK_GAIN_HOUR2 = (15, 35)
 PUSSY_ACCUM_RANGE = (5, 10)  # same range both hours, per spec
 PUSSY_CHECK_INTERVAL_SECONDS = 30
 
