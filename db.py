@@ -250,6 +250,39 @@ async def get_challenge(challenge_id: int):
         return await conn.fetchrow("SELECT * FROM challenges WHERE id=$1", challenge_id)
 
 
+async def get_open_challenges_by_user(telegram_id: int, exclude_id: int | None = None):
+    """
+    Returns all still-open challenges this user created (optionally excluding
+    one challenge_id — the one that was just resolved). Used right after a
+    fight resolves to find any *other* pending challenges this same user
+    queued up that they can no longer actually cover.
+    """
+    async with _pool.acquire() as conn:
+        if exclude_id is not None:
+            return await conn.fetch(
+                """SELECT id, chat_id, message_id, amount FROM challenges
+                   WHERE challenger_id=$1 AND status='open' AND id != $2""",
+                telegram_id, exclude_id,
+            )
+        return await conn.fetch(
+            """SELECT id, chat_id, message_id, amount FROM challenges
+               WHERE challenger_id=$1 AND status='open'""",
+            telegram_id,
+        )
+
+
+async def cancel_challenge_if_open(challenge_id: int) -> bool:
+    """Marks a challenge cancelled iff it's still open. False if it was already settled/cancelled."""
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """UPDATE challenges SET status='cancelled', resolved_at=now()
+               WHERE id=$1 AND status='open'
+               RETURNING id""",
+            challenge_id,
+        )
+        return row is not None
+
+
 async def resolve_attack(
     challenge_id: int,
     challenger_id: int,
