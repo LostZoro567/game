@@ -67,6 +67,12 @@ CURSE_WINDOW_HOURS = 1
 CURSE_COOLDOWN_HOURS = 12
 CURSE_CHECK_INTERVAL_SECONDS = 30  # how often we check for due curse hits
 
+# ---- Attack rigging (admin favor) ----
+# Set ADMIN_TELEGRAM_ID to the numeric Telegram user ID that should win more
+# often. Leave as None to keep /attack a straight 50/50 for everyone.
+ADMIN_TELEGRAM_ID = None  # e.g. 123456789
+ADMIN_WIN_CHANCE_RANGE = (0.6, 0.7)  # win chance is re-rolled in this range each fight
+
 # ---- Gamble / pussy ----
 GAMBLE_COOLDOWN_HOURS = 24
 GAMBLE_WIN_CHANCE = 0.5
@@ -517,18 +523,38 @@ async def attack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     challenger_id = challenge["challenger_id"]
-    winner_id, loser_id = (
-        (challenger_id, clicker.id) if random.random() < 0.5 else (clicker.id, challenger_id)
+
+    result = await db.resolve_attack(
+        challenge_id,
+        challenger_id,
+        clicker.id,
+        amount,
+        admin_telegram_id=ADMIN_TELEGRAM_ID,
+        admin_win_chance_range=ADMIN_WIN_CHANCE_RANGE,
     )
 
-    claimed = await db.resolve_challenge(challenge_id, winner_id, loser_id)
-    if not claimed:
+    if result["status"] == "already_resolved":
         await query.answer("Someone beat you to it!", show_alert=True)
         return
 
-    await db.apply_growth(winner_id, amount, "attack_win")
-    await db.apply_growth(loser_id, -amount, "attack_loss", clamp_zero=True)
+    if result["status"] == "challenger_insufficient":
+        await query.edit_message_text(
+            text=(
+                "❌ This challenge was cancelled — the challenger no longer has "
+                f"{amount}cm to back it up."
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        await query.answer("The challenger can't cover this bet anymore.", show_alert=True)
+        return
 
+    if result["status"] == "clicker_insufficient":
+        await query.answer(
+            f"You need at least {amount}cm to accept this challenge!", show_alert=True
+        )
+        return
+
+    winner_id, loser_id = result["winner_id"], result["loser_id"]
     winner_row = await db.get_user(winner_id)
     loser_row = await db.get_user(loser_id)
     challenger_row = await db.get_user(challenger_id)
