@@ -250,20 +250,113 @@ async def get_challenge(challenge_id: int):
         return await conn.fetchrow("SELECT * FROM challenges WHERE id=$1", challenge_id)
 
 
-async def resolve_challenge(challenge_id: int, winner_id: int, loser_id: int) -> bool:
+async def resolve_attack(
+    challenge_id: int,
+    challenger_id: int,
+    clicker_id: int,
+    amount: int,
+    admin_telegram_id: int | None = None,
+    admin_win_chance_range: tuple[float, float] = (0.5, 0.5),
+) -> dict:
     """
-    Atomically claims a challenge. Returns False if it was already resolved by
-    someone else (protects against two people tapping the button at once).
+    Atomically settles an /attack challenge in a single transaction:
+      - Locks the challenge row and bails out if it's no longer 'open'
+        (protects against two people tapping the button at once).
+      - Locks BOTH users' rows (challenger AND clicker/accepter) and re-checks
+        that they *currently* have >= amount cm, not just what the challenger
+        had back when they created the challenge with /attack.
+      - If the challenger has since spent/lost the cm they staked, the
+        challenge is cancelled instead of paying out — no more "create a big
+        challenge, drain your balance, still collect the full amount if you
+        win it later" exploit.
+      - Coin flip + payout happen in the same transaction as the balance
+        checks, so there's no window for either side's balance to change
+        between "verify" and "pay out".
+
+    Returns a dict: {"status": "resolved", "winner_id", "loser_id",
+    "winner_height", "loser_height"} or
+    {"status": "already_resolved"} or
+    {"status": "challenger_insufficient"} or
+    {"status": "clicker_insufficient"}.
     """
     async with _pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """UPDATE challenges
-               SET status='resolved', winner_id=$1, loser_id=$2, resolved_at=now()
-               WHERE id=$3 AND status='open'
-               RETURNING id""",
-            winner_id, loser_id, challenge_id,
-        )
-        return row is not None
+        async with conn.transaction():
+            challenge = await conn.fetchrow(
+                "SELECT status FROM challenges WHERE id=$1 FOR UPDATE", challenge_id
+            )
+            if challenge is None or challenge["status"] != "open":
+                return {"status": "already_resolved"}
+
+            # Lock both user rows in a fixed order (lowest telegram_id first)
+            # so two concurrent attacks between the same pair can never deadlock.
+            id_a, id_b = sorted((challenger_id, clicker_id))
+            rows = await conn.fetch(
+                "SELECT telegram_id, height_cm FROM users WHERE telegram_id IN ($1, $2) FOR UPDATE",
+                id_a, id_b,
+            )
+            heights = {r["telegram_id"]: r["height_cm"] for r in rows}
+
+            if heights.get(challenger_id, 0) < amount:
+                await conn.execute(
+                    "UPDATE challenges SET status='cancelled', resolved_at=now() WHERE id=$1",
+                    challenge_id,
+                )
+                return {"status": "challenger_insufficient"}
+
+            if heights.get(clicker_id, 0) < amount:
+                await conn.execute(
+                    "UPDATE challenges SET status='cancelled', resolved_at=now() WHERE id=$1",
+                    challenge_id,
+                )
+                return {"status": "clicker_insufficient"}
+
+            admin_in_fight = admin_telegram_id is not None and admin_telegram_id in (challenger_id, clicker_id)
+            if admin_in_fight:
+                admin_win_chance = random.uniform(*admin_win_chance_range)
+                admin_wins = random.random() < admin_win_chance
+                other_id = clicker_id if admin_telegram_id == challenger_id else challenger_id
+                winner_id, loser_id = (
+                    (admin_telegram_id, other_id) if admin_wins else (other_id, admin_telegram_id)
+                )
+            else:
+                winner_id, loser_id = (
+                    (challenger_id, clicker_id) if random.random() < 0.5 else (clicker_id, challenger_id)
+                )
+
+            claimed = await conn.fetchrow(
+                """UPDATE challenges
+                   SET status='resolved', winner_id=$1, loser_id=$2, resolved_at=now()
+                   WHERE id=$3 AND status='open'
+                   RETURNING id""",
+                winner_id, loser_id, challenge_id,
+            )
+            if claimed is None:
+                return {"status": "already_resolved"}
+
+            winner_row = await conn.fetchrow(
+                "UPDATE users SET height_cm = height_cm + $1 WHERE telegram_id=$2 RETURNING height_cm",
+                amount, winner_id,
+            )
+            loser_row = await conn.fetchrow(
+                "UPDATE users SET height_cm = height_cm - $1 WHERE telegram_id=$2 RETURNING height_cm",
+                amount, loser_id,
+            )
+            await conn.execute(
+                "INSERT INTO growth_log (telegram_id, amount, type) VALUES ($1, $2, 'attack_win')",
+                winner_id, amount,
+            )
+            await conn.execute(
+                "INSERT INTO growth_log (telegram_id, amount, type) VALUES ($1, $2, 'attack_loss')",
+                loser_id, -amount,
+            )
+
+            return {
+                "status": "resolved",
+                "winner_id": winner_id,
+                "loser_id": loser_id,
+                "winner_height": winner_row["height_cm"],
+                "loser_height": loser_row["height_cm"],
+            }
 
 
 async def create_loan(telegram_id: int, amount: int):
