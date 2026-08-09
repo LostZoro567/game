@@ -446,6 +446,9 @@ async def grow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+ATTACK_CANT_COVER_MSG = "😂 Meh. The initiator's dick is not long enough for such a big bet!"
+
+
 async def attack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     await track_chat(update)
@@ -538,13 +541,7 @@ async def attack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if result["status"] == "challenger_insufficient":
-        await query.edit_message_text(
-            text=(
-                "❌ This challenge was cancelled — the challenger no longer has "
-                f"{amount}cm to back it up."
-            ),
-            parse_mode=ParseMode.HTML,
-        )
+        await query.edit_message_text(text=ATTACK_CANT_COVER_MSG, parse_mode=ParseMode.HTML)
         await query.answer("The challenger can't cover this bet anymore.", show_alert=True)
         return
 
