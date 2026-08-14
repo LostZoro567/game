@@ -454,6 +454,44 @@ async def buy_condom(telegram_id: int, cost: int, duration_hours: int) -> bool:
             return True
 
 
+async def buy_condom_alert(telegram_id: int, cost: int) -> bool:
+    """Charges the user and arms a one-shot DM alert for when their condom expires."""
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT height_cm FROM users WHERE telegram_id=$1 FOR UPDATE", telegram_id
+            )
+            if row["height_cm"] < cost:
+                return False
+            await conn.execute(
+                "UPDATE users SET height_cm = height_cm - $1 WHERE telegram_id=$2",
+                cost, telegram_id,
+            )
+            await conn.execute(
+                "INSERT INTO growth_log (telegram_id, amount, type) VALUES ($1, $2, 'condom_alert_purchase')",
+                telegram_id, -cost,
+            )
+            await conn.execute(
+                "UPDATE users SET condom_alert=true WHERE telegram_id=$1", telegram_id
+            )
+            return True
+
+
+async def get_due_condom_alerts():
+    async with _pool.acquire() as conn:
+        return await conn.fetch(
+            """SELECT telegram_id FROM users
+               WHERE condom_alert=true AND condom_until IS NOT NULL AND condom_until <= now()"""
+        )
+
+
+async def clear_condom_alert(telegram_id: int):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET condom_alert=false WHERE telegram_id=$1", telegram_id
+        )
+
+
 async def set_last_snitch(telegram_id: int):
     async with _pool.acquire() as conn:
         await conn.execute(
@@ -685,3 +723,67 @@ async def finalize_pussy(telegram_id: int, bonus: int) -> int:
     if bonus > 0:
         return await apply_growth(telegram_id, bonus, "pussy_bonus")
     return (await get_user(telegram_id))["height_cm"]
+
+
+# ---------------- Achievements ----------------
+
+async def award_achievement(telegram_id: int, key: str) -> bool:
+    """Inserts the badge if not already owned. Returns True iff this was a new unlock."""
+    async with _pool.acquire() as conn:
+        try:
+            await conn.execute(
+                "INSERT INTO user_achievements (telegram_id, achievement_key) VALUES ($1, $2)",
+                telegram_id, key,
+            )
+            return True
+        except asyncpg.UniqueViolationError:
+            return False
+
+
+async def get_achievements(telegram_id: int) -> list[str]:
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT achievement_key FROM user_achievements WHERE telegram_id=$1 ORDER BY earned_at",
+            telegram_id,
+        )
+        return [r["achievement_key"] for r in rows]
+
+
+async def count_growth_log(telegram_id: int, log_type: str) -> int:
+    """Generic counter, e.g. how many 'attack_win' or 'snitch_gain' rows a user has."""
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) AS c FROM growth_log WHERE telegram_id=$1 AND type=$2",
+            telegram_id, log_type,
+        )
+        return row["c"]
+
+
+# ---------------- Dick of the Day ----------------
+
+async def get_active_chat_ids() -> list[int]:
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("SELECT DISTINCT chat_id FROM chat_members")
+        return [r["chat_id"] for r in rows]
+
+
+async def get_top_grower_for_chat(chat_id: int, start, end):
+    """
+    Top /grow-only gainer (not attacks/snitches/etc.) between [start, end) among
+    users who've been seen in this chat. Note: since height is a single global
+    number per user (not per-chat), this reflects each member's own /grow rolls
+    during the window, not chat-scoped cm — a user active in multiple groups
+    only has one real height, but their /grow gains still count fairly here.
+    """
+    async with _pool.acquire() as conn:
+        return await conn.fetchrow(
+            """SELECT u.telegram_id, u.first_name, u.username, SUM(g.amount) AS gained
+               FROM growth_log g
+               JOIN users u ON u.telegram_id = g.telegram_id
+               JOIN chat_members cm ON cm.telegram_id = g.telegram_id AND cm.chat_id = $1
+               WHERE g.type = 'grow' AND g.created_at >= $2 AND g.created_at < $3
+               GROUP BY u.telegram_id, u.first_name, u.username
+               ORDER BY gained DESC
+               LIMIT 1""",
+            chat_id, start, end,
+        )
