@@ -2,6 +2,7 @@ import logging
 import os
 import random
 from datetime import datetime, timedelta, timezone
+from datetime import time as dt_time
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -25,7 +26,9 @@ logger = logging.getLogger(__name__)
 
 # ---- Tunable game constants ----
 GROW_MIN, GROW_MAX = 10, 25
-GROW_COOLDOWN_HOURS = 24
+# /grow no longer runs on a rolling 24h cooldown — it resets at 00:00 UTC every
+# day. So if you grow at 11:59pm UTC and again at 12:01am UTC, that's fine,
+# that's two different "days" as far as the bot's concerned.
 
 LOAN_AMOUNT = 10
 LOAN_FLOOR = -10  # a defaulted loan can push a user down to this, but no further
@@ -56,8 +59,8 @@ CONDOM_PRICE_TIERS = [  # (height ceiling, price) — first match wins
 ]
 
 # ---- Snitch ----
-SNITCH_STEAL_MIN_PCT = 10
-SNITCH_STEAL_MAX_PCT = 30
+SNITCH_STEAL_MIN_PCT = 5
+SNITCH_STEAL_MAX_PCT = 10
 SNITCH_COOLDOWN_HOURS = 1
 
 # ---- Curse this group ----
@@ -82,6 +85,62 @@ FUCK_GAIN_HOUR1 = (10, 25)
 FUCK_GAIN_HOUR2 = (15, 35)
 PUSSY_ACCUM_RANGE = (5, 10)  # same range both hours, per spec
 PUSSY_CHECK_INTERVAL_SECONDS = 30
+
+# ---- Shop: expiry alert ----
+WARNING_MSG_COST = 10_000  # DMs you the moment your condom protection runs out
+CONDOM_ALERT_CHECK_INTERVAL_SECONDS = 300
+
+# ---- Dick of the Day ----
+# Posted + pinned once daily in every group the bot has seen activity in,
+# based on that group's biggest /grow-only gainer from the previous UTC day.
+# Pinning requires the bot to be a group admin — it'll just skip the pin
+# (and log a warning) if it isn't.
+DICK_OF_THE_DAY_TIME_UTC = dt_time(0, 5, tzinfo=timezone.utc)  # 5 min after reset
+
+# ---- Rank titles ----
+# (min height_cm, title) — sorted ascending, highest match <= height wins.
+RANK_TITLES = [
+    (float("-inf"), "Struggling 💀"),
+    (0, "Twig 🌱"),
+    (50, "Grower Not Shower 🌿"),
+    (100, "Triple Digits 💯"),
+    (250, "Respectable 📏"),
+    (500, "Certified Unit 🍆"),
+    (1000, "Absolute Unit 🍆🍆"),
+    (2500, "Legend 👑"),
+    (5000, "Mythical 🐉"),
+    (10000, "Godlike ⚡"),
+]
+
+# ---- Achievements ----
+# key -> (emoji, title, description). New keys just need a matching
+# db.award_achievement(...) call somewhere to actually get unlocked.
+ACHIEVEMENTS = {
+    "first_grow": ("🌱", "Sprouted", "Used /grow for the first time."),
+    "height_100": ("💯", "Triple Digits", "Reached 100cm."),
+    "height_500": ("🍆", "Certified Unit", "Reached 500cm."),
+    "height_1000": ("👑", "Absolute Unit", "Reached 1000cm."),
+    "first_loan": ("💸", "Desperate Times", "Took your first loan."),
+    "loan_default": ("💀", "Bankrupt", "Defaulted on a loan and went negative."),
+    "attack_wins_10": ("⚔️", "Gladiator", "Won 10 /attack fights."),
+    "snitch_10": ("🕵️", "Public Enemy", "Successfully snitched 10 times."),
+    "dotd": ("🏆", "Daily Champion", "Won Dick of the Day."),
+}
+
+
+def rank_title(height_cm: int) -> str:
+    title = RANK_TITLES[0][1]
+    for threshold, name in RANK_TITLES:
+        if height_cm >= threshold:
+            title = name
+        else:
+            break
+    return title
+
+
+def achievement_text(name_html: str, key: str) -> str:
+    emoji, title, desc = ACHIEVEMENTS[key]
+    return f"🏅 Achievement unlocked for {name_html}: <b>{emoji} {title}</b> — {desc}"
 
 
 def mention(user) -> str:
@@ -391,20 +450,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
         "📏 Welcome to <b>DickGrow Bot</b>!\n\n"
         "<b>Core</b>\n"
-        "/grow — grow 10-25cm, once a day\n"
+        "/grow — grow 10-25cm, once per day, resets midnight UTC\n"
         "/attack &lt;amount&gt; — challenge the group for any amount from 1cm up to your full height\n"
-        "/me — check your stats\n"
+        "/me — check your stats, rank, and badge count\n"
         "/loan — borrow 10cm when you're at 0\n"
-        "/leaderboard — today's and all-time rankings\n\n"
+        "/leaderboard — today's and all-time rankings\n"
+        "/achievements — see your unlocked badges\n\n"
         "<b>Chaos</b>\n"
         "/pray — 1% shot at +100cm, once a day\n"
         "/simp &lt;amount&gt; @user — tribute cm to someone, max 50/day\n"
         "/hex @user — curse their next /grow for 15cm\n"
-        "/shop, /buycondom — protection from /snitch\n"
-        "/snitch @user — steal 20-30% of their height\n"
+        "/shop, /buycondom, /buywarning — protection (and alerts) against /snitch\n"
+        "/snitch @user — steal 5-10% of their height\n"
         "/cursethisgroup — curse 5 random members for an hour\n"
         "/gamble — 50/50 for +50cm or 2h as a pussy\n"
-        "/fuck @user — if someone's a pussy, get yours\n"
+        "/fuck @user — if someone's a pussy, get yours\n\n"
+        "Every day the group's top /grow gainer gets crowned 👑 <b>Dick of the Day</b> "
+        "and pinned (needs the bot to be a group admin)."
     )
 
 
@@ -417,15 +479,16 @@ async def grow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     last_grow = user["last_grow"]
     now = datetime.now(timezone.utc)
-    if last_grow is not None:
-        elapsed = (now - last_grow).total_seconds()
-        if elapsed < GROW_COOLDOWN_HOURS * 3600:
-            remaining = GROW_COOLDOWN_HOURS * 3600 - elapsed
-            hours, minutes = int(remaining // 3600), int((remaining % 3600) // 60)
-            await update.message.reply_text(
-                f"⏳ You already grew today. Come back in {hours}h {minutes}m."
-            )
-            return
+    if last_grow is not None and last_grow.astimezone(timezone.utc).date() == now.date():
+        next_reset = datetime.combine(now.date() + timedelta(days=1), dt_time.min, tzinfo=timezone.utc)
+        remaining = (next_reset - now).total_seconds()
+        hours, minutes = int(remaining // 3600), int((remaining % 3600) // 60)
+        await update.message.reply_text(
+            f"⏳ You already grew today. Resets at midnight UTC — come back in {hours}h {minutes}m."
+        )
+        return
+
+    is_first_grow = last_grow is None
 
     amount = random.randint(GROW_MIN, GROW_MAX)
     hexed = await db.consume_hex_if_active(u.id)
@@ -444,6 +507,16 @@ async def grow(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🌱 {mention(u)} grew <b>+{amount}cm</b> today!\n"
             f"📏 New height: <b>{new_height}cm</b>"
         )
+
+    # ---- achievement checks ----
+    unlocked_keys = []
+    if is_first_grow and await db.award_achievement(u.id, "first_grow"):
+        unlocked_keys.append("first_grow")
+    for key, threshold in (("height_100", 100), ("height_500", 500), ("height_1000", 1000)):
+        if new_height >= threshold and await db.award_achievement(u.id, key):
+            unlocked_keys.append(key)
+    for key in unlocked_keys:
+        await update.message.reply_html(achievement_text(mention(u), key))
 
 
 ATTACK_CANT_COVER_MSG = "😂 Meh. The initiator's dick is not long enough for such a big bet!"
@@ -569,6 +642,11 @@ async def attack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📏 {loser_name}: {loser_row['height_cm']}cm"
     )
 
+    win_count = await db.count_growth_log(winner_id, "attack_win")
+    if win_count >= 10 and await db.award_achievement(winner_id, "attack_wins_10"):
+        winner_name_html = f'<a href="tg://user?id={winner_id}">{winner_name}</a>'
+        result_text += "\n\n" + achievement_text(winner_name_html, "attack_wins_10")
+
     await query.edit_message_text(text=result_text, parse_mode=ParseMode.HTML)
     await query.answer("You won! 🏆" if winner_id == clicker.id else "You lost this one 💀")
 
@@ -592,9 +670,31 @@ async def me(update: Update, context: ContextTypes.DEFAULT_TYPE):
         remaining = max(0, (ends - now).total_seconds())
         pussy_text = f"\n😳 Pussy status: {fmt_hours_minutes(remaining)} remaining"
 
+    badge_count = len(await db.get_achievements(u.id))
+
     await update.message.reply_html(
-        f"📏 <b>{u.first_name}</b>\nHeight: <b>{user['height_cm']}cm</b>{loan_text}{condom_text}{pussy_text}"
+        f"📏 <b>{u.first_name}</b>\nHeight: <b>{user['height_cm']}cm</b>\n"
+        f"🎖️ Rank: <b>{rank_title(user['height_cm'])}</b>\n"
+        f"🏅 Achievements: {badge_count} (see <code>/achievements</code>)"
+        f"{loan_text}{condom_text}{pussy_text}"
     )
+
+
+async def achievements_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    await track_chat(update)
+    await db.get_or_create_user(u.id, u.username, u.first_name)
+    earned = await db.get_achievements(u.id)
+
+    if not earned:
+        await update.message.reply_html(f"🏅 {mention(u)}, no achievements yet. Get grinding.")
+        return
+
+    lines = [f"🏅 <b>{u.first_name}'s Achievements</b> ({len(earned)}/{len(ACHIEVEMENTS)})"]
+    for key in earned:
+        emoji, title, desc = ACHIEVEMENTS[key]
+        lines.append(f"{emoji} <b>{title}</b> — {desc}")
+    await update.message.reply_html("\n".join(lines))
 
 
 async def loan(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -618,6 +718,8 @@ async def loan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚠️ It will be automatically deducted in {LOAN_DURATION_HOURS} hours. "
         f"If you're still at 0cm by then, you'll go to <b>-10cm</b>."
     )
+    if await db.award_achievement(u.id, "first_loan"):
+        await update.message.reply_html(achievement_text(mention(u), "first_loan"))
 
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -633,7 +735,9 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines.append("\n👑 <b>All-Time Rankings</b>")
     for i, row in enumerate(alltime_top, 1):
-        lines.append(f"{i}. {display_name(row)} — {row['height_cm']}cm")
+        lines.append(
+            f"{i}. {display_name(row)} — {row['height_cm']}cm ({rank_title(row['height_cm'])})"
+        )
 
     await update.message.reply_html("\n".join(lines))
 
@@ -788,8 +892,10 @@ async def shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
         "🛒 <b>Shop</b>\n\n"
         f"🛡️ Condom — {price}cm — blocks /snitch for {CONDOM_DURATION_HOURS}h\n"
-        f"(price scales with your size — bigger you are, more it costs)\n\n"
-        "Buy with <code>/buycondom</code>"
+        f"(price scales with your size — bigger you are, more it costs)\n"
+        "Buy with <code>/buycondom</code>\n\n"
+        f"🔔 Expiry Alert — {WARNING_MSG_COST}cm — I'll DM you the moment your condom runs out\n"
+        "Buy with <code>/buywarning</code>"
     )
 
 
@@ -815,6 +921,33 @@ async def buycondom(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_html(
         random.choice(CONDOM_SUCCESS).format(name=mention(u), cost=cost, hours=CONDOM_DURATION_HOURS)
+    )
+
+
+async def buywarning(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    await track_chat(update)
+    user = await db.get_or_create_user(u.id, u.username, u.first_name)
+    if await block_if_pussy(update, u, user):
+        return
+
+    if user["condom_alert"]:
+        await update.message.reply_html(
+            f"🔔 {mention(u)}, you've already got an alert queued for your current protection."
+        )
+        return
+
+    ok = await db.buy_condom_alert(u.id, WARNING_MSG_COST)
+    if not ok:
+        await update.message.reply_html(
+            f"🔔 You need {WARNING_MSG_COST}cm for that, {mention(u)}. Long way to go."
+        )
+        return
+
+    await update.message.reply_html(
+        f"🔔 {mention(u)} bought an expiry alert for {WARNING_MSG_COST}cm. "
+        f"I'll DM you the second your condom runs out — make sure you've hit "
+        f"/start in a private chat with me first, or I can't message you."
     )
 
 
@@ -859,9 +992,14 @@ async def snitch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_html(
-        random.choice(SNITCH_SUCCESS).format(name=mention(u), target=mention(target_user), amount=amount)
+    snitch_text = random.choice(SNITCH_SUCCESS).format(
+        name=mention(u), target=mention(target_user), amount=amount
     )
+    steal_count = await db.count_growth_log(u.id, "snitch_gain")
+    if steal_count >= 10 and await db.award_achievement(u.id, "snitch_10"):
+        snitch_text += "\n\n" + achievement_text(mention(u), "snitch_10")
+
+    await update.message.reply_html(snitch_text)
 
 
 async def cursethisgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -986,8 +1124,10 @@ async def loan_repayment_job(context: ContextTypes.DEFAULT_TYPE):
     due_loans = await db.get_due_loans(LOAN_DURATION_HOURS)
     for loan_row in due_loans:
         telegram_id = loan_row["telegram_id"]
-        await db.apply_growth(telegram_id, -LOAN_AMOUNT, "loan_repay", floor=LOAN_FLOOR)
+        new_height = await db.apply_growth(telegram_id, -LOAN_AMOUNT, "loan_repay", floor=LOAN_FLOOR)
         await db.clear_loan(telegram_id)
+        if new_height < 0:
+            await db.award_achievement(telegram_id, "loan_default")
         logger.info(f"Repaid loan for user {telegram_id}")
 
 
@@ -1044,6 +1184,59 @@ async def pussy_status_job(context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"Failed to send pussy finalize message to chat {row['pussy_chat_id']}: {e}")
 
 
+async def condom_alert_job(context: ContextTypes.DEFAULT_TYPE):
+    due = await db.get_due_condom_alerts()
+    for row in due:
+        telegram_id = row["telegram_id"]
+        await db.clear_condom_alert(telegram_id)
+        try:
+            await context.bot.send_message(
+                chat_id=telegram_id,
+                text="🔔 Your condom just expired — you're exposed to /snitch again. Might wanna rebuy.",
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send condom expiry DM to {telegram_id}: {e}")
+
+
+async def dick_of_the_day_job(context: ContextTypes.DEFAULT_TYPE):
+    """Runs once daily. Announces + pins yesterday's top /grow gainer per group."""
+    now = datetime.now(timezone.utc)
+    day_start = datetime.combine(now.date() - timedelta(days=1), dt_time.min, tzinfo=timezone.utc)
+    day_end = datetime.combine(now.date(), dt_time.min, tzinfo=timezone.utc)
+
+    for chat_id in await db.get_active_chat_ids():
+        top = await db.get_top_grower_for_chat(chat_id, day_start, day_end)
+        if top is None or not top["gained"] or top["gained"] <= 0:
+            continue
+
+        name_html = f'<a href="tg://user?id={top["telegram_id"]}">{display_name(top)}</a>'
+        text = (
+            "👑 <b>Dick of the Day</b> 👑\n\n"
+            f"{name_html} grew the most yesterday: <b>+{top['gained']}cm</b> from /grow alone. Bow down."
+        )
+
+        try:
+            msg = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            logger.warning(f"Failed to send Dick of the Day to chat {chat_id}: {e}")
+            continue
+
+        try:
+            await context.bot.pin_chat_message(chat_id=chat_id, message_id=msg.message_id)
+        except Exception as e:
+            logger.warning(f"Couldn't pin Dick of the Day in chat {chat_id} (bot needs admin rights): {e}")
+
+        if await db.award_achievement(top["telegram_id"], "dotd"):
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=achievement_text(name_html, "dotd"),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to send Dick of the Day badge notice to chat {chat_id}: {e}")
+
+
 # ---------------- Startup ----------------
 
 async def post_init(application: Application):
@@ -1073,6 +1266,8 @@ def main():
     application.add_handler(CommandHandler("cursethisgroup", cursethisgroup))
     application.add_handler(CommandHandler("gamble", gamble))
     application.add_handler(CommandHandler("fuck", fuck))
+    application.add_handler(CommandHandler("buywarning", buywarning))
+    application.add_handler(CommandHandler("achievements", achievements_cmd))
 
     application.job_queue.run_repeating(
         loan_repayment_job, interval=LOAN_CHECK_INTERVAL_SECONDS, first=10
@@ -1083,6 +1278,10 @@ def main():
     application.job_queue.run_repeating(
         pussy_status_job, interval=PUSSY_CHECK_INTERVAL_SECONDS, first=15
     )
+    application.job_queue.run_repeating(
+        condom_alert_job, interval=CONDOM_ALERT_CHECK_INTERVAL_SECONDS, first=20
+    )
+    application.job_queue.run_daily(dick_of_the_day_job, time=DICK_OF_THE_DAY_TIME_UTC)
 
     logger.info("Bot starting...")
     application.run_polling()
