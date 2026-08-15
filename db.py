@@ -534,17 +534,19 @@ async def snitch_steal(actor_id: int, target_id: int, min_pct: int, max_pct: int
             return amount
 
 
-async def get_leaderboard_today(limit: int = 5):
+async def get_leaderboard_today(chat_id: int, limit: int = 5):
+    """Today's top gainers among members seen in this specific chat."""
     async with _pool.acquire() as conn:
         return await conn.fetch(
             """SELECT u.telegram_id, u.first_name, u.username, SUM(g.amount) AS gained
                FROM growth_log g
                JOIN users u ON u.telegram_id = g.telegram_id
+               JOIN chat_members cm ON cm.telegram_id = g.telegram_id AND cm.chat_id = $1
                WHERE g.created_at >= date_trunc('day', now())
                GROUP BY u.telegram_id, u.first_name, u.username
                ORDER BY gained DESC
-               LIMIT $1""",
-            limit,
+               LIMIT $2""",
+            chat_id, limit,
         )
 
 
@@ -610,14 +612,18 @@ async def apply_curse_hit(hit_id: int, telegram_id: int, amount: int) -> int:
     return await apply_growth(telegram_id, -amount, "cursed", clamp_zero=True)
 
 
-async def get_leaderboard_alltime(limit: int = 5):
+async def get_leaderboard_alltime(chat_id: int, limit: int = 5):
+    """All-time height ranking among members seen in this specific chat.
+    Note: height itself is global (shared across every chat a user is in) —
+    this only filters *which users* show up, not their actual cm total."""
     async with _pool.acquire() as conn:
         return await conn.fetch(
-            """SELECT telegram_id, first_name, username, height_cm
-               FROM users
-               ORDER BY height_cm DESC
-               LIMIT $1""",
-            limit,
+            """SELECT u.telegram_id, u.first_name, u.username, u.height_cm
+               FROM users u
+               JOIN chat_members cm ON cm.telegram_id = u.telegram_id AND cm.chat_id = $1
+               ORDER BY u.height_cm DESC
+               LIMIT $2""",
+            chat_id, limit,
         )
 
 
