@@ -106,7 +106,7 @@ RANK_TITLES = [
     (100, "Triple Digits 💯"),
     (250, "Respectable 📏"),
     (500, "Certified Unit 🍆"),
-    (1000, "Absolute Unit 🍆🍆"),
+    (1000, "Absolute Unit 🌵"),
     (2500, "Legend 👑"),
     (5000, "Mythical 🐉"),
     (10000, "Godlike ⚡"),
