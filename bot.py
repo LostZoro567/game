@@ -106,7 +106,7 @@ RANK_TITLES = [
     (100, "Triple Digits 💯"),
     (250, "Respectable 📏"),
     (500, "Certified Unit 🍆"),
-    (1000, "Absolute Unit 🌵"),
+    (1000, "Absolute Unit 🍆🍆"),
     (2500, "Legend 👑"),
     (5000, "Mythical 🐉"),
     (10000, "Godlike ⚡"),
@@ -723,17 +723,19 @@ async def loan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    today_top = await db.get_leaderboard_today(limit=5)
-    alltime_top = await db.get_leaderboard_alltime(limit=5)
+    await track_chat(update)
+    chat_id = update.effective_chat.id
+    today_top = await db.get_leaderboard_today(chat_id, limit=5)
+    alltime_top = await db.get_leaderboard_alltime(chat_id, limit=5)
 
-    lines = ["🏆 <b>Today's Top Gainers</b>"]
+    lines = ["🏆 <b>Today's Top Gainers</b> (this group)"]
     if today_top:
         for i, row in enumerate(today_top, 1):
             lines.append(f"{i}. {display_name(row)} — {row['gained']:+d}cm today")
     else:
         lines.append("No activity yet today.")
 
-    lines.append("\n👑 <b>All-Time Rankings</b>")
+    lines.append("\n👑 <b>All-Time Rankings</b> (this group)")
     for i, row in enumerate(alltime_top, 1):
         lines.append(
             f"{i}. {display_name(row)} — {row['height_cm']}cm ({rank_title(row['height_cm'])})"
